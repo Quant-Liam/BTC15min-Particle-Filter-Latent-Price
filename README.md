@@ -116,25 +116,180 @@ CLI example:
 ```bash
 python run_backtest.py \
   --years 2 \
-  --granularity 900 \
-  --entry-timing open \
   --market-up-price 0.50 \
   --market-down-price 0.50 \
-  --output-csv backtest_results.csv \
-  --distribution-csv backtest_distribution.csv
+  --output-xlsx pf_regime_backtest.xlsx
 ```
 
-Useful regime options:
+The backtest engine lives in [/Users/liamrodgers/Desktop/Python/Personal/btc15m/backtest.py](/Users/liamrodgers/Desktop/Python/Personal/btc15m/backtest.py) and uses the regime model plus particle filter exactly as they are computed in the math modules. The strategy logic then applies two layers:
 
-- `--disable-regime-filter`: turn off the bull/bear/neutral trade gate
-- `--regime-lookback`: candles used for regime fitting, with `0` meaning fit once on the full series
-- `--regime-min-history`: minimum candles before the regime model is considered active
+- a baseline trade gate
+- an additional filtered-trade gate used to compare a stricter cohort against the baseline cohort
 
-Useful particle-filter options:
+### Baseline Trade Gate
 
-- `--disable-particle-filter`: turn off the fair-value indicator in backtests
-- `--particle-filter-lookback`: candles used by the particle filter, with `0` meaning full-series
-- `--particle-filter-particles`: particle count for the fair-value estimate
+A row becomes a baseline trade only if all of the following are true:
+
+- regime is `bull` or `bear`, not `neutral`
+- `regime_confidence > regime_confidence_threshold` with default `0.45`
+- the PF fair-value gap favors the regime direction
+- estimated `p_win` is above the fee-adjusted break-even probability
+- Kelly fraction is greater than zero after applying `fractional_kelly` and `max_fraction`
+
+In plain English:
+
+- `bull` means only `UP` shares can be traded
+- `bear` means only `DOWN` shares can be traded
+- `neutral` means no trade
+- even in `bull` or `bear`, the model still requires a favorable PF gap and positive edge after fees
+
+Common baseline no-trade reasons include:
+
+- `neutral_regime`
+- `regime_confidence_below_threshold`
+- `pf_gap_not_favorable`
+- `negative_edge_after_fees`
+- `kelly_zero_after_risk_controls`
+
+### Additional Filtered-Trade Gate
+
+If a row is already a baseline trade, it can also be tested against a stricter filter layer. By default the filtered cohort requires:
+
+- `normalized_gap >= 0.8`
+- `raw_gap >= 100.0`
+- `pf_confidence <= 0.4`
+
+Those defaults come from [/Users/liamrodgers/Desktop/Python/Personal/run_backtest.py](/Users/liamrodgers/Desktop/Python/Personal/run_backtest.py).
+
+Optional filters can also be enabled:
+
+- `regime_confidence <= max_regime_confidence` when `use_regime_filter=True`
+- `p_win >= min_p_win` when `use_pwin_filter=True`
+- entry hour must be in `allowed_hours` if provided
+- entry weekday must be in `allowed_days` if provided
+
+Important note: the current code treats `pf_confidence` as a maximum allowed value in the filtered cohort, not a minimum.
+
+### How `p_win` Is Calculated
+
+The backtest does not use historical hit rate as `p_win`. It derives `p_win` from the PF fair-value gap.
+
+The pipeline is:
+
+1. The particle filter estimates:
+   - PF fair price
+   - PF uncertainty
+   - PF confidence
+2. The PF fair-value gap is turned into a directional edge score:
+   - for `UP`: `raw_gap = fair_price_pf - live_price`
+   - for `DOWN`: `raw_gap = live_price - fair_price_pf`
+3. That gap is normalized:
+   - `z = raw_gap / max(pf_uncertainty, live_price * min_gap_scale, epsilon)`
+4. The normalized gap is mapped through a sigmoid:
+   - `p_base = 1 / (1 + exp(-alpha * z))`
+5. If confidence shrink is enabled, the probability is pulled back toward `0.5`:
+   - `confidence_multiplier = pf_confidence * regime_confidence` when both are present
+   - `p_final = 0.5 + (p_base - 0.5) * confidence_multiplier`
+
+The backtest uses `p_final` as `p_win`.
+
+Interpretation:
+
+- larger favorable PF gap -> larger `z`
+- larger `z` -> larger sigmoid probability
+- lower confidence -> `p_win` gets shrunk back toward `50/50`
+
+This is a model-derived probability, not an empirically calibrated win-rate estimate.
+
+### Share-Market Payoff and Kelly Sizing
+
+The payoff layer assumes a binary prediction-market share, not sportsbook-style odds.
+
+For a share bought at market price `x`:
+
+- the share settles to `1.0` if correct
+- the share settles to `0.0` if incorrect
+- gross win profit per share is `1 - x`
+- gross loss per share is `x`
+- expected value per share is `p - x`
+
+Fees are handled by converting raw share price into an effective all-in share price. That makes the break-even condition intuitive:
+
+- trade only if `p_win > effective_share_price`
+
+The Kelly layer then sizes the position using binary-share math:
+
+- `b = (1 - x_eff) / x_eff`
+- `q = 1 - p`
+- `f* = (b * p - q) / b`
+- equivalently `f* = (p - x_eff) / (1 - x_eff)`
+
+Risk controls are then applied:
+
+- `fractional_kelly`
+- `max_fraction`
+
+The backtest export and dashboard expose these fields so the economics are inspectable:
+
+- `market_share_price`
+- `effective_share_price`
+- `p_win`
+- `break_even_prob`
+- `kelly_fraction`
+- `raw_kelly`
+- `expected_log_growth`
+
+`kelly_size_pct` is simply `100 * kelly_fraction`.
+
+### Backtest Output Columns
+
+The workbook export includes both directional and share-economics columns.
+
+Key directional columns:
+
+- `trade_side`
+- `regime`
+- `regime_confidence`
+- `pf_fair_price`
+- `raw_gap`
+- `normalized_gap`
+- `p_win`
+
+Key share-economics columns:
+
+- `market_share_price`
+- `effective_share_price`
+- `break_even_prob`
+- `kelly_fraction`
+- `kelly_size_pct`
+- `raw_kelly`
+- `expected_log_growth`
+- `share_settlement_value`
+- `gross_share_pnl_per_share`
+- `net_share_pnl_per_share`
+- `kelly_bankroll_return`
+
+### Useful CLI Options
+
+- `--market-up-price`
+- `--market-down-price`
+- `--fee-rate`
+- `--alpha`
+- `--min-gap-scale`
+- `--fractional-kelly`
+- `--max-fraction`
+- `--regime-confidence-threshold`
+- `--particle-filter-particles`
+- `--min-normalized-gap`
+- `--min-raw-gap`
+- `--max-pf-confidence`
+- `--use-regime-filter`
+- `--max-regime-confidence`
+- `--use-pwin-filter`
+- `--min-p-win`
+- `--allowed-hours`
+- `--allowed-days`
+- `--run-sweep`
 
 ## Dependencies
 

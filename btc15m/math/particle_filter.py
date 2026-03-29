@@ -10,8 +10,12 @@ from .regime import RegimeState, compute_regime_frame
 
 @dataclass(frozen=True)
 class ParticleFilterConfig:
+    # Tuning area: more particles reduce Monte Carlo noise but cost more CPU.
     num_particles: int = 300
+    # Tuning area: lower thresholds resample less often; higher thresholds keep
+    # particle diversity tighter but can add more sampling noise.
     resample_threshold: float = 0.50
+    # Tuning area: how much price history the PF sees when run standalone.
     lookback: int = 240
 
 
@@ -49,6 +53,24 @@ def compute_particle_filter_frame(
     regime_frame: pd.DataFrame | None = None,
     config: ParticleFilterConfig | None = None,
 ) -> pd.DataFrame:
+    """Estimate fair value with a regime-conditioned particle filter.
+
+    State equations in log-price space:
+    - d_t = rho_r * d_{t-1} + (1 - rho_r) * mu_r + eta_t
+    - f_t = f_{t-1} + d_t + epsilon_t
+    - y_t = f_t + nu_t
+
+    where:
+    - f_t is latent fair log-price
+    - d_t is latent drift
+    - y_t is observed log-price
+    - rho_r, mu_r, and the noise scales depend on the current regime r
+
+    Tuning areas:
+    - config.num_particles
+    - config.resample_threshold
+    - _regime_scale(), which maps each regime into drift/volatility settings
+    """
     active_config = config or ParticleFilterConfig()
     closes = _extract_close_series(candles_15m)
     if closes.empty:
@@ -67,10 +89,17 @@ def compute_particle_filter_frame(
     # percentage moves rather than raw BTC-dollar moves.
     log_prices = np.log(closes.to_numpy(dtype=float))
     n_particles = int(max(active_config.num_particles, 50))
+    # Fixed seed keeps backtests reproducible even though the PF is stochastic.
+    # Tuning area: if you want multiple Monte Carlo runs, expose the seed.
     rng = np.random.default_rng(42)
 
     initial_regime_row = _lookup_regime_row(regime_frame, closes.index[0])
     initial_scale = _regime_scale(initial_regime_row)
+    # Initial prior:
+    # f_0 ~ N(log(P_0), obs_noise^2)
+    # d_0 ~ N(mu_r, drift_noise^2)
+    # so the PF begins centered near the first observation, but with enough
+    # spread to learn a latent fair value distinct from the tape price.
     fair_particles = log_prices[0] + rng.normal(scale=max(initial_scale["obs_noise"], 1e-4), size=n_particles)
     drift_particles = np.full(n_particles, initial_scale["drift_anchor"], dtype=float)
     drift_particles += rng.normal(scale=max(initial_scale["drift_noise"], 1e-5), size=n_particles)
@@ -117,6 +146,8 @@ def compute_particle_filter_frame(
         uncertainty = float(fair_price * np.sqrt(max(fair_log_var, 0.0)))
         gap = get_pf_gap(observed_price=float(observed_price), fair_price=fair_price)
         gap_pct = float(gap / fair_price) if fair_price > 0 else float("nan")
+        # Confidence is normalized ESS, so it lives in (0, 1]. High values mean
+        # weights are broad; low values mean only a few particles explain price.
         confidence = float(ess / n_particles)
 
         price_below_fair = is_price_below_pf_fair_value(float(observed_price), fair_price)
@@ -169,6 +200,9 @@ def project_particle_filter_fair_price(
     drift: float,
     step_fraction: float = 1.0,
 ) -> float:
+    # In log-price space, one-step projection is:
+    # f_(t+h) ~= f_t * exp(drift * h)
+    # where h is measured in 15m-bar fractions.
     clipped_fraction = float(np.clip(step_fraction, 0.0, 1.5))
     return float(fair_price * np.exp(drift * clipped_fraction))
 
@@ -261,7 +295,10 @@ def _regime_scale(regime_row: dict[str, float | str]) -> dict[str, float]:
 
     if regime == "bull":
         drift_anchor = bull_anchor
+        # Tuning area: 0.96 keeps bull drift persistent while still mean-reverting.
         drift_persistence = 0.96
+        # Tuning area: lower fair_noise makes fair value smoother; higher values
+        # let latent fair value chase price faster during trend regimes.
         fair_noise = max(0.0004, regime_vol * 0.40)
     elif regime == "bear":
         drift_anchor = bear_anchor
@@ -269,19 +306,26 @@ def _regime_scale(regime_row: dict[str, float | str]) -> dict[str, float]:
         fair_noise = max(0.0004, regime_vol * 0.40)
     else:
         drift_anchor = neutral_anchor
+        # Neutral is less persistent so the latent drift decays faster to zero.
         drift_persistence = 0.90
+        # Neutral lets fair value wander more because direction is less reliable.
         fair_noise = max(0.0005, regime_vol * 0.55)
 
     return {
         "drift_anchor": drift_anchor,
         "drift_persistence": drift_persistence,
+        # Tuning area: drift_noise controls how much the latent slope can move
+        # from bar to bar independent of the mean-reversion anchor.
         "drift_noise": max(0.00005, regime_vol * 0.10),
         "fair_noise": fair_noise,
+        # Tuning area: obs_noise controls how forgiving the observation model is.
+        # Larger values make the filter trust the current price less.
         "obs_noise": max(0.0008, regime_vol * 0.65),
     }
 
 
 def _normalize_log_weights(log_weights: np.ndarray) -> np.ndarray:
+    # Subtracting max(log_weight) is the standard log-sum-exp stabilization.
     shifted = log_weights - np.max(log_weights)
     weights = np.exp(shifted)
     total = float(np.sum(weights))
@@ -296,6 +340,8 @@ def _systematic_resample(
     weights: np.ndarray,
     rng: np.random.Generator,
 ) -> tuple[np.ndarray, np.ndarray]:
+    # Systematic resampling uses one random offset and equally spaced draws,
+    # which usually gives lower-variance ancestry selection than iid sampling.
     n_particles = len(weights)
     positions = (rng.random() + np.arange(n_particles)) / n_particles
     cumulative = np.cumsum(weights)

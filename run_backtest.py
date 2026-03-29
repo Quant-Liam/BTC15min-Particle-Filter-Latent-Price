@@ -31,7 +31,7 @@ from btc15m.backtest import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the BTC regime + PF + Kelly backtest and export an Excel workbook.")
     parser.add_argument("--product-id", default="BTC-USD")
-    parser.add_argument("--years", type=float, default=2.0)
+    parser.add_argument("--years", type=float, default=1.0)
     parser.add_argument("--granularity-15m", type=int, default=900)
     parser.add_argument("--candles-15m-csv", type=Path, default=None)
     parser.add_argument("--output-xlsx", type=Path, default=Path("pf_regime_backtest.xlsx"))

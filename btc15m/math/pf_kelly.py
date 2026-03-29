@@ -54,7 +54,17 @@ def compute_pf_edge_score(
     epsilon: float = 1e-8,
     trade_side: str = "UP",
 ) -> PFEdgeScoreResult:
-    """Normalize the PF fair-value gap into a dimensionless z-style edge score."""
+    """Normalize the PF fair-value gap into a dimensionless z-style edge score.
+
+    Equation:
+    - raw_gap = fair_price - live_price   for UP trades
+    - raw_gap = live_price - fair_price   for DOWN trades
+    - z = raw_gap / max(pf_uncertainty, live_price * min_gap_scale, epsilon)
+
+    Tuning area:
+    - min_gap_scale prevents tiny uncertainty estimates from creating
+      unrealistically large z-scores.
+    """
 
     side = str(trade_side).upper()
     if side not in {"UP", "DOWN"}:
@@ -86,8 +96,21 @@ def pf_gap_to_win_probability(
     regime_confidence: float | None = None,
     use_confidence_shrink: bool = True,
 ) -> PFProbabilityResult:
-    """Map a normalized PF edge score into a clipped binary win probability."""
+    """Map a normalized PF edge score into a clipped binary win probability.
 
+    Equation:
+    - p_base = sigmoid(alpha * z)
+    - p_final = 0.5 + (p_base - 0.5) * confidence_multiplier
+
+    Tuning areas:
+    - alpha controls how aggressively z-score edge becomes p_win.
+    - clip_min / clip_max cap extreme probabilities.
+    - use_confidence_shrink toggles whether uncertain PF/regime states shrink
+      probability back toward 0.5.
+    """
+
+    # Tuning area: alpha is the slope of the z -> p mapping. Higher alpha makes
+    # the same fair-value gap create a more decisive p_win.
     sigmoid_input = float(np.clip(float(alpha) * float(z), -60.0, 60.0))
     p_base = float(1.0 / (1.0 + np.exp(-sigmoid_input)))
     p_base = float(np.clip(p_base, clip_min, clip_max))
@@ -101,6 +124,8 @@ def pf_gap_to_win_probability(
             if np.isfinite(value):
                 confidences.append(float(np.clip(value, 0.0, 1.0)))
         if confidences:
+            # The product acts like a joint-confidence shrinker. If either model
+            # is weak, the final probability is pulled back toward 50/50.
             confidence_multiplier = float(np.prod(confidences))
 
     p_final = 0.5 + (p_base - 0.5) * confidence_multiplier
@@ -131,12 +156,18 @@ def compute_kelly_from_pf(
     clip_max: float = 0.99,
     use_confidence_shrink: bool = True,
 ) -> PFKellySizingResult:
-    """Convert PF fair value into a binary win probability, then into Kelly size.
+    """Convert PF fair value into a binary-share win probability, then into Kelly size.
 
     Example:
         A bull regime with BTC trading below PF fair value produces a positive
         z-score, which lifts p_win above 0.5 and can generate a non-zero Kelly
-        fraction against the UP contract price.
+        fraction against the UP share price.
+
+    System application:
+    - Regime decides direction: bull -> UP, bear -> DOWN, neutral -> no trade.
+    - PF fair value decides whether the market is cheap or rich versus that view.
+    - The normalized gap becomes p_win.
+    - Kelly compares p_win to binary-share cost and converts the edge into size.
     """
 
     regime = str(regime_label).lower()
@@ -204,6 +235,7 @@ def compute_kelly_from_pf(
         no_trade_reason=None,
     )
 
+    # If fair value does not favor the regime direction, stop before Kelly.
     if edge.raw_gap <= 0:
         return _replace_reason(result, "pf_gap_not_favorable")
 
@@ -238,8 +270,9 @@ def compute_kelly_from_pf(
         no_trade_reason=None,
     )
 
+    # No trade if estimated win probability does not clear the all-in share cost.
     if prob.p_final <= kelly.break_even_prob:
-        return _replace_reason(result, "p_win_below_break_even_after_fees")
+        return _replace_reason(result, "negative_edge_after_fees")
     if kelly.fraction <= 0:
         return _replace_reason(result, "kelly_zero_after_risk_controls")
 

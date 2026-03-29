@@ -86,11 +86,27 @@ def compute_regime_frame(
     lookback: int = 240,
     min_history: int = 80,
 ) -> pd.DataFrame:
+    """Estimate a 3-state regime path from 15m BTC closes.
+
+    Pipeline:
+    1. Convert closes into log returns r_t = log(P_t) - log(P_{t-1}).
+    2. Fit a GARCH(1,1) filter for conditional variance sigma_t^2.
+    3. Standardize returns z_t = r_t / sigma_t.
+    4. Fit a 3-state Markov switching model on z_t.
+    5. Relabel the raw hidden states into bear / neutral / bull by their
+       weighted mean return in raw return space.
+
+    Tuning areas:
+    - lookback controls how much recent history is used in the fit.
+    - min_history controls how much data is required before the model is trusted.
+    """
     closes = _extract_close_series(candles_15m)
     if closes.empty:
         return pd.DataFrame()
 
     if lookback > 0:
+        # Tuning area: a shorter lookback makes the regime detector react faster,
+        # while a longer lookback makes the estimates smoother and more stable.
         closes = closes.tail(max(lookback, min_history + 1))
 
     # 15m log return:
@@ -115,12 +131,17 @@ def compute_regime_frame(
             warnings.simplefilter("ignore", ConvergenceWarning)
             # statsmodels then fits a 3-state Markov switching regression with
             # switching variance on z_t. The hidden state is the regime.
+            # statsmodels emits a frequency warning when given a DatetimeIndex
+            # without freq metadata. The model only needs the numeric series here,
+            # and we reattach the original timestamps after fitting.
             model = MarkovRegression(
-                standardized_returns,
+                standardized_returns.to_numpy(dtype=float),
                 k_regimes=3,
                 trend="c",
                 switching_variance=True,
             )
+            # Tuning area: maxiter / em_iter change how hard we push the optimizer
+            # before giving up and falling back to the heuristic classifier.
             result = model.fit(disp=False, maxiter=100, em_iter=5)
 
         probabilities = result.filtered_marginal_probabilities
@@ -156,6 +177,9 @@ def compute_regime_frame(
         labeled["regime"] = regime_prob_frame.idxmax(axis=1).str.replace("_prob", "", regex=False)
         labeled["confidence"] = regime_prob_frame.max(axis=1).astype(float)
         labeled["garch_volatility"] = np.sqrt(garch_variance.loc[standardized_returns.index]).astype(float)
+        # Compare current conditional volatility to a 32-bar baseline so the rest
+        # of the system can tell whether volatility is elevated versus "normal".
+        # Tuning area: 32 bars is an 8-hour baseline on 15m candles.
         rolling_baseline = labeled["garch_volatility"].rolling(32, min_periods=8).mean()
         baseline_fallback = float(labeled["garch_volatility"].mean()) if not labeled.empty else 1.0
         rolling_baseline = rolling_baseline.fillna(baseline_fallback).replace(0.0, np.nan)
@@ -165,6 +189,7 @@ def compute_regime_frame(
 
         # These are hand-tuned guardrails, not model-estimated parameters.
         # We demote weak or sign-inconsistent states to neutral.
+        # Tuning area: confidence below 0.45 is treated as too ambiguous to trade.
         low_conf_mask = labeled["confidence"] < 0.45
         weak_drift_mask = labeled["regime"].eq("bull") & (labeled["bull_mean_return"] <= 0)
         weak_drift_mask |= labeled["regime"].eq("bear") & (labeled["bear_mean_return"] >= 0)
@@ -201,6 +226,9 @@ def _fit_garch11_variance(returns: pd.Series) -> pd.Series:
         alpha_raw = float(np.exp(theta[1]))
         beta_raw = float(np.exp(theta[2]))
         scale = 1.0 + alpha_raw + beta_raw
+        # Re-parameterize alpha and beta so they stay positive and so
+        # alpha + beta < 0.995. This keeps the GARCH recursion stationary:
+        # sigma_t^2 = omega + alpha * r_{t-1}^2 + beta * sigma_{t-1}^2.
         alpha = 0.995 * alpha_raw / scale
         beta = 0.995 * beta_raw / scale
         return omega, alpha, beta
@@ -220,6 +248,8 @@ def _fit_garch11_variance(returns: pd.Series) -> pd.Series:
 
     # The initial guess biases beta high and alpha modest because BTC volatility
     # usually clusters more through persistence than single-shock reaction.
+    # Tuning area: this prior assumes volatility persistence mostly comes from
+    # beta (lagged variance) rather than alpha (single return shocks).
     start = np.log(np.array([initial_variance * 0.05, 0.08, 0.90], dtype=float))
     opt = minimize(neg_log_likelihood, start, method="L-BFGS-B")
     omega, alpha, beta = unpack(opt.x if opt.success else start)
@@ -261,7 +291,10 @@ def _weighted_state_stats(
     garch_variance: pd.Series,
     weights: pd.Series,
 ) -> tuple[float, float]:
-    # Weighted mean and volatility under each regime probability path.
+    # Weighted regime statistics:
+    # E[r | state] ~= sum_t w_t r_t / sum_t w_t
+    # E[sigma | state] ~= sum_t w_t sigma_t / sum_t w_t
+    # where w_t is the filtered probability of that latent state at time t.
     aligned_returns = returns.loc[weights.index].to_numpy(dtype=float)
     aligned_variance = garch_variance.loc[weights.index].to_numpy(dtype=float)
     aligned_weights = weights.to_numpy(dtype=float)
@@ -297,6 +330,8 @@ def _build_reason(row: pd.Series) -> str:
 def _fallback_snapshot(returns: pd.Series, fit_status: str) -> RegimeSnapshot:
     # Fallback is deliberately simple and heuristic; it keeps the dashboard
     # usable if the Markov-GARCH optimization fails.
+    # Tuning area: these 8 / 24 / 32 bar windows and the drift thresholds below
+    # are heuristic guardrails, not statistically estimated parameters.
     short = float(returns.tail(8).mean()) if not returns.empty else 0.0
     medium = float(returns.tail(24).mean()) if len(returns) >= 8 else short
     vol = float(returns.tail(32).std()) if len(returns) >= 8 else 0.0

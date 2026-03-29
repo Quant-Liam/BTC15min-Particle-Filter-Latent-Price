@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import product
+import os
 from pathlib import Path
+import tempfile
 from typing import Sequence
 
 import numpy as np
@@ -13,16 +15,27 @@ from .math import ParticleFilterConfig, compute_kelly_from_pf, compute_particle_
 
 @dataclass(frozen=True)
 class BacktestConfig:
+    # Market / payoff assumptions.
     market_up_price: float = 0.50
     market_down_price: float = 0.50
     fee_rate: float = 0.0156
+
+    # Tuning area: PF edge-score -> p_win calibration.
     alpha: float = 1.5
     min_gap_scale: float = 0.001
+
+    # Tuning area: portfolio risk controls after p_win is estimated.
     fractional_kelly: float = 0.50
     max_fraction: float = 0.20
+
+    # Tuning area: baseline regime gate.
     regime_confidence_threshold: float = 0.45
+
+    # Tuning area: particle-filter Monte Carlo settings.
     particle_filter_particles: int = 300
     use_confidence_shrink: bool = True
+
+    # Tuning area: post-model trade-quality filters.
     min_normalized_gap: float = 0.8
     min_raw_gap: float = 100.0
     max_pf_confidence: float = 0.4
@@ -78,6 +91,8 @@ def build_backtest_signal_frame(
     if candles.empty:
         return candles
 
+    # Backtest uses full available history so each bar sees the entire path up
+    # to that point. The 81-bar floor guarantees enough data for regime fitting.
     lookback = max(len(candles), 81)
     regime_frame = compute_regime_frame(candles, lookback=lookback)
     pf_frame = compute_particle_filter_frame(
@@ -115,7 +130,12 @@ def evaluate_trade_filters(
     allowed_hours: Sequence[int] | None = None,
     allowed_days: Sequence[int] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Return whether a baseline trade passes the high-edge filter layer."""
+    """Return whether a baseline trade passes the high-edge filter layer.
+
+    These are policy filters layered on top of the statistical model outputs.
+    They do not change the regime or PF equations; they decide when a modeled
+    edge is strong enough to allow a trade in backtests.
+    """
 
     failures: list[str] = []
 
@@ -149,7 +169,15 @@ def run_backtest(
     candles_15m: pd.DataFrame,
     config: BacktestConfig | None = None,
 ) -> pd.DataFrame:
-    """Backtest interval-open entries with baseline and filtered trade cohorts."""
+    """Backtest interval-open entries with binary-share sizing outputs.
+
+    Directional outcome is still determined from BTC price movement over the bar,
+    but the reported economics are expressed as prediction-market shares:
+    - pay x to buy one share
+    - settle to 1.0 if correct, else 0.0
+    - gross per-share PnL = settlement - x
+    - net per-share PnL = settlement - effective_share_price
+    """
 
     active_config = config or BacktestConfig()
     signal_frame = build_backtest_signal_frame(candles_15m, config=active_config)
@@ -199,7 +227,27 @@ def run_backtest(
         )
         baseline_trade_taken = int(baseline_no_trade_reason is None)
         trade_side = sizing.trade_side if sizing is not None else None
-        win_loss = _win_loss_for_trade(trade_side, entry_price, exit_price) if baseline_trade_taken else np.nan
+        share_settlement_value = (
+            _share_settlement_value_for_trade(trade_side, entry_price, exit_price)
+            if baseline_trade_taken
+            else np.nan
+        )
+        win_loss = int(share_settlement_value) if baseline_trade_taken else np.nan
+        gross_share_pnl_per_share = (
+            _share_pnl_per_share(share_settlement_value, market_share_price)
+            if baseline_trade_taken and market_share_price is not None
+            else np.nan
+        )
+        net_share_pnl_per_share = (
+            _share_pnl_per_share(share_settlement_value, sizing.effective_share_price)
+            if baseline_trade_taken and sizing is not None and sizing.effective_share_price is not None
+            else np.nan
+        )
+        kelly_bankroll_return = (
+            _kelly_bankroll_return(share_settlement_value, sizing.kelly_fraction, sizing.effective_share_price)
+            if baseline_trade_taken and sizing is not None and sizing.effective_share_price is not None
+            else np.nan
+        )
 
         row = {
             "signal_time_utc": signal_ts,
@@ -228,6 +276,10 @@ def run_backtest(
             "break_even_prob": sizing.break_even_prob if sizing is not None else np.nan,
             "effective_share_price": sizing.effective_share_price if sizing is not None else np.nan,
             "net_odds": sizing.net_odds if sizing is not None else np.nan,
+            "share_settlement_value": share_settlement_value,
+            "gross_share_pnl_per_share": gross_share_pnl_per_share,
+            "net_share_pnl_per_share": net_share_pnl_per_share,
+            "kelly_bankroll_return": kelly_bankroll_return,
             "entry_hour_utc": int(entry_ts.hour),
             "entry_weekday": int(entry_ts.weekday()),
             "baseline_trade_taken": baseline_trade_taken,
@@ -285,8 +337,12 @@ def summarize_backtest(results: pd.DataFrame) -> pd.DataFrame:
         "trade_frequency_reduction_pct": reduction,
         "wins_filtered": int(filtered["win_loss"].sum()) if filtered_count else 0,
         "wins_unfiltered": int(baseline["win_loss"].sum()) if baseline_count else 0,
+        "avg_net_share_pnl_per_share_filtered": float(filtered["net_share_pnl_per_share"].mean()) if filtered_count else np.nan,
+        "avg_net_share_pnl_per_share_unfiltered": float(baseline["net_share_pnl_per_share"].mean()) if baseline_count else np.nan,
         "avg_kelly_fraction_filtered": float(filtered["kelly_fraction"].mean()) if filtered_count else np.nan,
         "avg_kelly_fraction_unfiltered": float(baseline["kelly_fraction"].mean()) if baseline_count else np.nan,
+        "avg_kelly_bankroll_return_filtered": float(filtered["kelly_bankroll_return"].mean()) if filtered_count else np.nan,
+        "avg_kelly_bankroll_return_unfiltered": float(baseline["kelly_bankroll_return"].mean()) if baseline_count else np.nan,
     }
     return pd.DataFrame([summary])
 
@@ -425,7 +481,12 @@ def export_backtest_excel(
     summary: pd.DataFrame,
     sweep_results: pd.DataFrame | None = None,
 ) -> Path:
-    """Write baseline, filtered, and summary views to a workbook."""
+    """Write baseline, filtered, and summary views to a workbook.
+
+    The exported trade rows use binary-share economics, not sportsbook-style
+    odds. `market_share_price` is the raw share cost, `effective_share_price`
+    is the all-in cost after fees, and settlement is always either 1.0 or 0.0.
+    """
 
     workbook_path = Path(output_path)
     baseline = results.loc[results["baseline_trade_taken"] == 1].copy() if not results.empty else pd.DataFrame()
@@ -435,15 +496,29 @@ def export_backtest_excel(
     excel_filtered = _excel_safe_frame(filtered)
     excel_results = _excel_safe_frame(results)
     excel_sweep = _excel_safe_frame(sweep_results) if sweep_results is not None else None
+    workbook_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_workbook_path: Path | None = None
 
     try:
-        with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:
+        with tempfile.NamedTemporaryFile(
+            prefix=f"{workbook_path.stem}_",
+            suffix=workbook_path.suffix or ".xlsx",
+            dir=tempfile.gettempdir(),
+            delete=False,
+        ) as temp_file:
+            temp_workbook_path = Path(temp_file.name)
+
+        # Write the workbook to a local temp file first, then atomically replace
+        # the destination. This is much more robust on synced folders where
+        # random-access writes inside the zip container can time out.
+        with pd.ExcelWriter(temp_workbook_path, engine="openpyxl") as writer:
             excel_summary.to_excel(writer, sheet_name="summary", index=False)
             excel_baseline.to_excel(writer, sheet_name="baseline_trades", index=False)
             excel_filtered.to_excel(writer, sheet_name="filtered_trades", index=False)
             excel_results.to_excel(writer, sheet_name="all_intervals", index=False)
             if excel_sweep is not None and not excel_sweep.empty:
                 excel_sweep.to_excel(writer, sheet_name="grid_search", index=False)
+        os.replace(temp_workbook_path, workbook_path)
     except ModuleNotFoundError as exc:  # pragma: no cover - startup guard
         if exc.name == "openpyxl":
             raise RuntimeError(
@@ -451,6 +526,17 @@ def export_backtest_excel(
                 "`python -m pip install openpyxl` and rerun the backtest."
             ) from exc
         raise
+    except TimeoutError as exc:
+        temp_location = f" Temporary workbook may be at {temp_workbook_path}." if temp_workbook_path is not None else ""
+        raise RuntimeError(
+            f"Timed out while exporting the Excel workbook to {workbook_path}.{temp_location}"
+        ) from exc
+    finally:
+        if temp_workbook_path is not None and temp_workbook_path.exists():
+            try:
+                temp_workbook_path.unlink()
+            except OSError:
+                pass
 
     return workbook_path
 
@@ -482,11 +568,39 @@ def _market_share_price_for_regime(config: BacktestConfig, regime_label: str) ->
 
 
 def _win_loss_for_trade(trade_side: str | None, entry_price: float, exit_price: float) -> int:
+    return int(_share_settlement_value_for_trade(trade_side, entry_price, exit_price))
+
+
+def _share_settlement_value_for_trade(trade_side: str | None, entry_price: float, exit_price: float) -> float:
+    # Binary-share settlement is always 1.0 for a correct prediction and 0.0
+    # otherwise. The market share price is handled separately in the PnL columns.
     if str(trade_side).upper() == "UP":
-        return int(exit_price > entry_price)
+        return float(exit_price > entry_price)
     if str(trade_side).upper() == "DOWN":
-        return int(exit_price < entry_price)
-    return 0
+        return float(exit_price < entry_price)
+    return 0.0
+
+
+def _share_pnl_per_share(settlement_value: float, share_price: float | None) -> float:
+    if share_price is None or not np.isfinite(share_price):
+        return float("nan")
+    # Per-share PnL is settlement - cost, so the same helper works for both
+    # gross PnL (raw market price) and net PnL (effective all-in price).
+    return float(settlement_value - float(share_price))
+
+
+def _kelly_bankroll_return(
+    settlement_value: float,
+    kelly_fraction: float,
+    effective_share_price: float | None,
+) -> float:
+    if effective_share_price is None or not np.isfinite(effective_share_price):
+        return float("nan")
+    if not np.isfinite(kelly_fraction):
+        return float("nan")
+    if settlement_value >= 1.0:
+        return float(kelly_fraction * ((1.0 - effective_share_price) / effective_share_price))
+    return float(-kelly_fraction)
 
 
 def _vectorized_filter_mask(
