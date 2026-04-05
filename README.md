@@ -1,21 +1,34 @@
-# BTC 15m Regime Console
+# BTC 15m Kalshi Training Bot
 
-This repo now centers the live BTC tracker around a simpler regime-gated workflow:
+This repo now has an automated execution layer on top of the existing BTC 15-minute strategy framework.
 
-- live Coinbase BTC price on the main dashboard
-- fixed 720 x 1-minute candles for the chart
-- a 3-state Markov switching regime model fed by a GARCH volatility filter
-- a regime-aware particle filter fair-value indicator
-- bull regime = only `UP` trades
-- bear regime = only `DOWN` trades
-- neutral regime = no trade
-- clearer Kelly sizing breakdown
-- paper-trade logging with live BTC spot price at entry
-- a reusable backtest engine and CLI
+The strategy is still the decision-maker:
+
+- regime classification stays in place
+- particle-filter fair value stays in place
+- PF gap and entry direction logic stay in place
+- `p_win` and Kelly outputs stay in place for analytics
+
+The new system adds:
+
+- automated Kalshi DEMO execution
+- a continuous 15-minute trading loop
+- local SQLite persistence for signals, orders, fills, trades, logs, and bankroll history
+- live `TRAINING P&L` on the Streamlit dashboard
+- hard environment isolation so `LIVE` mode fails closed
+- manual training allocation sizing with default `20%` bankroll per trade
 
 ## Project Layout
 
-- [/Users/liamrodgers/Desktop/Python/Personal/dashboard.py](/Users/liamrodgers/Desktop/Python/Personal/dashboard.py): Streamlit dashboard
+- [/Users/liamrodgers/Desktop/Python/Personal/app/dashboard.py](/Users/liamrodgers/Desktop/Python/Personal/app/dashboard.py): Streamlit dashboard for the training bot
+- [/Users/liamrodgers/Desktop/Python/Personal/dashboard.py](/Users/liamrodgers/Desktop/Python/Personal/dashboard.py): thin Streamlit entrypoint wrapper
+- [/Users/liamrodgers/Desktop/Python/Personal/config/settings.py](/Users/liamrodgers/Desktop/Python/Personal/config/settings.py): environment, bankroll, and safety configuration
+- [/Users/liamrodgers/Desktop/Python/Personal/data/kalshi_market_client.py](/Users/liamrodgers/Desktop/Python/Personal/data/kalshi_market_client.py): Kalshi DEMO market discovery and order routing
+- [/Users/liamrodgers/Desktop/Python/Personal/data/reference_price_feed.py](/Users/liamrodgers/Desktop/Python/Personal/data/reference_price_feed.py): swappable BTC reference feed abstraction, now defaulting back to Coinbase
+- [/Users/liamrodgers/Desktop/Python/Personal/execution/training_executor.py](/Users/liamrodgers/Desktop/Python/Personal/execution/training_executor.py): demo-only order execution and settlement tracking
+- [/Users/liamrodgers/Desktop/Python/Personal/engine/trading_loop.py](/Users/liamrodgers/Desktop/Python/Personal/engine/trading_loop.py): continuous trading loop
+- [/Users/liamrodgers/Desktop/Python/Personal/analytics/pnl_engine.py](/Users/liamrodgers/Desktop/Python/Personal/analytics/pnl_engine.py): training bankroll and P&L calculations
+- [/Users/liamrodgers/Desktop/Python/Personal/storage/session_store.py](/Users/liamrodgers/Desktop/Python/Personal/storage/session_store.py): SQLite persistence layer
 - [/Users/liamrodgers/Desktop/Python/Personal/btc15m/math/](/Users/liamrodgers/Desktop/Python/Personal/btc15m/math): all model math in one place
 - [/Users/liamrodgers/Desktop/Python/Personal/btc15m/math/features.py](/Users/liamrodgers/Desktop/Python/Personal/btc15m/math/features.py): price and market feature engineering
 - [/Users/liamrodgers/Desktop/Python/Personal/btc15m/math/model.py](/Users/liamrodgers/Desktop/Python/Personal/btc15m/math/model.py): probability model and feature contributions
@@ -37,27 +50,61 @@ Top-level `btc15m/features.py`, `btc15m/model.py`, and `btc15m/kelly.py` remain 
 pip install -r requirements.txt
 ```
 
-2. Run the dashboard:
+2. Copy the demo env template and fill in your Kalshi DEMO API credentials:
+
+```bash
+cp .env.example .env
+```
+
+3. Run the dashboard:
 
 ```bash
 streamlit run dashboard.py
 ```
 
-3. In the sidebar:
+4. In the sidebar:
 
-- use `Trade Action` at the top to log or settle paper trades
-- set `UP` and `DOWN` market prices
-- tune Kelly settings
-- optionally open `External Signals` for funding, liquidation, and news inputs
+- set the training allocation fraction
+- set the bankroll stop threshold
+- start or pause trading
+- reset the training session when needed
 
 ## Dashboard Notes
 
-- the old order-book wall map was removed to keep the interface cleaner
-- the price chart always uses `720` one-minute candles
-- the dashboard still uses Coinbase live price and order-book data under the hood
-- logged paper trades now capture both the prediction market price and live BTC spot price
-- Kelly is shown as a full setup table so the break-even point, raw Kelly, candidate size, and applied size are visible
-- the particle filter fair price is plotted on the main price chart and `price - PF fair value` is visible as both a metric and a lower panel
+- the top bar shows `TRAINING` mode, bot status, trading active/stopped, and a `DEMO ONLY` safety badge
+- the portfolio panel reports current bankroll, realized/unrealized `TRAINING P&L`, win rate, drawdown, and trade count
+- the strategy panel shows the live BTC reference price, PF fair value, PF gap, regime, regime confidence, model probability, and Kelly analytics
+- the execution panel shows the active Kalshi BTC market, YES/NO prices, current position, and last order status
+- the log area shows trade history, fills, and runtime errors from the SQLite-backed session store
+
+## Training Execution Rules
+
+- `TRAINING` mode is fully functional and routes only to `https://demo-api.kalshi.co/trade-api/v2`
+- `LIVE` mode is intentionally blocked in code and raises an error if selected
+- trade sizing uses a manual training allocation fraction, defaulting to `20%` of bankroll
+- Kelly is logged for analytics only and is not used to size demo orders
+- the loop will not trade when:
+  - no active BTC 15-minute market is available
+  - the market is too close to expiration
+  - the spread is too wide
+  - liquidity is too thin
+  - a duplicate trade would be created
+  - bankroll is below the configured stop threshold
+
+## Persistence
+
+The training bot persists session state locally in SQLite at the path from `STATE_DB_PATH`.
+
+Stored data includes:
+
+- signals
+- orders
+- fills
+- trades
+- bankroll history
+- logs
+
+This lets the bot resume an existing training session and also lets you reset the bankroll cleanly from the dashboard.
 
 ## Regime Model
 
@@ -135,13 +182,6 @@ A row becomes a baseline trade only if all of the following are true:
 - the PF fair-value gap favors the regime direction
 - estimated `p_win` is above the fee-adjusted break-even probability
 - Kelly fraction is greater than zero after applying `fractional_kelly` and `max_fraction`
-
-In plain English:
-
-- `bull` means only `UP` shares can be traded
-- `bear` means only `DOWN` shares can be traded
-- `neutral` means no trade
-- even in `bull` or `bear`, the model still requires a favorable PF gap and positive edge after fees
 
 Common baseline no-trade reasons include:
 

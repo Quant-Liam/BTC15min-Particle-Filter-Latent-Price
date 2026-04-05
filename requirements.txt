@@ -7,3 +7,4 @@ statsmodels>=0.14
 streamlit>=1.40
 streamlit-autorefresh>=1.0
 python-dotenv>=1.0
+cryptography>=43.0
