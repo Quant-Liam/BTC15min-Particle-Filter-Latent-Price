@@ -61,6 +61,8 @@ class AppSettings:
     allocation_fraction: float
     stop_bankroll_threshold: float
     regime_confidence_threshold: float
+    min_pf_confidence: float
+    min_pf_gap_dollars: float
     pf_alpha: float
     pf_min_gap_scale: float
     fee_rate: float
@@ -112,6 +114,8 @@ class AppSettings:
                 else float(overrides.stop_bankroll_threshold)
             ),
             regime_confidence_threshold=self.regime_confidence_threshold,
+            min_pf_confidence=self.min_pf_confidence,
+            min_pf_gap_dollars=self.min_pf_gap_dollars,
             pf_alpha=self.pf_alpha,
             pf_min_gap_scale=self.pf_min_gap_scale,
             fee_rate=self.fee_rate,
@@ -161,6 +165,8 @@ def load_settings(env_path: str | Path | None = None) -> AppSettings:
         allocation_fraction=_float_env("TRAINING_ALLOCATION_FRACTION", 0.20),
         stop_bankroll_threshold=_float_env("TRAINING_STOP_BANKROLL_THRESHOLD", 20.0),
         regime_confidence_threshold=_float_env("REGIME_CONFIDENCE_THRESHOLD", 0.45),
+        min_pf_confidence=_float_env("PF_MIN_CONFIDENCE", 0.01),
+        min_pf_gap_dollars=_float_env("PF_MIN_GAP_DOLLARS", 25.0),
         pf_alpha=_float_env("PF_ALPHA", 1.5),
         pf_min_gap_scale=_float_env("PF_MIN_GAP_SCALE", 0.001),
         fee_rate=_float_env("KALSHI_FEE_RATE", 0.0156),

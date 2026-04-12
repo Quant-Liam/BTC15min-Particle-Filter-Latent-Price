@@ -1,51 +1,46 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from itertools import product
+import math
 import os
 from pathlib import Path
 import tempfile
-from typing import Sequence
 
 import numpy as np
 import pandas as pd
 
-from .math import ParticleFilterConfig, compute_kelly_from_pf, compute_particle_filter_frame, compute_regime_frame
+from .math import ParticleFilterConfig, compute_particle_filter_frame
+
+FINAL_DATASET_COLUMNS = [
+    "contract_start",
+    "contract_end",
+    "interval_start_price",
+    "pf_fair_value_at_entry",
+    "pf_distance",
+    "actual_gap",
+    "entry_price",
+    "exit_price",
+    "confidence",
+    "binary_win",
+    "trade_side",
+    "gross_pnl_per_trade",
+    "fee",
+    "net_pnl_per_trade",
+    "skip_reason",
+]
 
 
 @dataclass(frozen=True)
 class BacktestConfig:
-    # Market / payoff assumptions.
     market_up_price: float = 0.50
     market_down_price: float = 0.50
-    fee_rate: float = 0.0156
-
-    # Tuning area: PF edge-score -> p_win calibration.
-    alpha: float = 1.5
-    min_gap_scale: float = 0.001
-
-    # Tuning area: portfolio risk controls after p_win is estimated.
-    fractional_kelly: float = 0.50
-    max_fraction: float = 0.20
-
-    # Tuning area: baseline regime gate.
-    regime_confidence_threshold: float = 0.45
-
-    # Tuning area: particle-filter Monte Carlo settings.
+    contracts_per_trade: float = 1.0
     particle_filter_particles: int = 300
-    use_confidence_shrink: bool = True
-
-    # Tuning area: post-model trade-quality filters.
-    min_normalized_gap: float = 0.8
-    min_raw_gap: float = 100.0
-    max_pf_confidence: float = 0.4
-    use_regime_filter: bool = False
-    max_regime_confidence: float = 0.8
-    use_pwin_filter: bool = False
-    min_p_win: float = 0.6
-    allowed_hours: tuple[int, ...] | None = None
-    allowed_days: tuple[int, ...] | None = None
-    log_filter_reasons: bool = True
+    particle_filter_lookback: int = 240
+    particle_filter_resample_threshold: float = 0.50
+    particle_filter_use_regime_context: bool = False
+    min_abs_gap: float = 25.0
+    min_pf_confidence: float = 0.01
 
 
 def normalize_candles(candles: pd.DataFrame) -> pd.DataFrame:
@@ -80,422 +75,410 @@ def normalize_candles(candles: pd.DataFrame) -> pd.DataFrame:
     return frame[["open", "high", "low", "close", "volume"]]
 
 
+def build_interval_frame(
+    candles_15m: pd.DataFrame,
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Build one row per 15m contract using only information known at entry.
+
+    Lookahead prevention:
+    - The row for contract start ``T`` uses the PF snapshot from the previous
+      completed 15-minute bar.
+    - That PF snapshot is the latest fair value available exactly at ``T``.
+    - The current bar's close is used only as the realized settlement price.
+    """
+
+    active_config = config or BacktestConfig()
+    candles = normalize_candles(candles_15m)
+    if candles.empty or len(candles) < 2:
+        return pd.DataFrame()
+
+    pf_lookback = (
+        max(int(active_config.particle_filter_lookback), len(candles))
+        if int(active_config.particle_filter_lookback) > 0
+        else 0
+    )
+    pf_frame = compute_particle_filter_frame(
+        candles_15m=candles,
+        config=ParticleFilterConfig(
+            num_particles=active_config.particle_filter_particles,
+            resample_threshold=active_config.particle_filter_resample_threshold,
+            lookback=pf_lookback,
+            use_regime_context=active_config.particle_filter_use_regime_context,
+        ),
+    )
+    if pf_frame.empty:
+        return pd.DataFrame()
+
+    bar_delta = _infer_bar_delta(candles.index)
+    rows: list[dict[str, object]] = []
+    for row_number in range(1, len(candles)):
+        signal_row = pf_frame.iloc[row_number - 1]
+        entry_row = candles.iloc[row_number]
+        contract_start = candles.index[row_number]
+
+        rows.append(
+            {
+                "contract_start": contract_start,
+                "contract_end": contract_start + bar_delta,
+                "interval_start_price": float(entry_row["open"]),
+                "pf_fair_value_at_entry": _finite_or_nan(signal_row.get("pf_fair_price")),
+                "entry_price": float(entry_row["open"]),
+                "exit_price": float(entry_row["close"]),
+                "confidence": _finite_or_nan(signal_row.get("pf_confidence")),
+            }
+        )
+
+    frame = pd.DataFrame(rows)
+    return compute_pf_distance(frame)
+
+
+def build_interval_signal_frame(
+    candles_15m: pd.DataFrame,
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Backward-compatible alias for interval frame construction."""
+
+    return build_interval_frame(candles_15m, config=config)
+
+
+def build_interval_signal_dataframe(
+    candles_15m: pd.DataFrame,
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Backward-compatible alias for interval frame construction."""
+
+    return build_interval_frame(candles_15m, config=config)
+
+
 def build_backtest_signal_frame(
     candles_15m: pd.DataFrame,
     config: BacktestConfig | None = None,
 ) -> pd.DataFrame:
-    """Join OHLC candles with full-history regime and particle-filter state."""
+    """Backward-compatible alias for interval frame construction."""
+
+    return build_interval_frame(candles_15m, config=config)
+
+
+def compute_pf_distance(interval_frame: pd.DataFrame) -> pd.DataFrame:
+    """Compute PF fair-value distance versus the interval start price."""
+
+    frame = interval_frame.copy()
+    frame["pf_distance"] = frame["pf_fair_value_at_entry"] - frame["interval_start_price"]
+    frame["actual_gap"] = frame["pf_distance"].abs()
+    return frame
+
+
+def generate_signal_from_pf_distance(
+    interval_frame: pd.DataFrame,
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Generate raw UP/DOWN/NO_SIGNAL decisions from the PF distance threshold."""
 
     active_config = config or BacktestConfig()
-    candles = normalize_candles(candles_15m)
-    if candles.empty:
-        return candles
+    frame = interval_frame.copy()
+    frame["trade_side"] = "NO_TRADE"
 
-    # Backtest uses full available history so each bar sees the entire path up
-    # to that point. The 81-bar floor guarantees enough data for regime fitting.
-    lookback = max(len(candles), 81)
-    regime_frame = compute_regime_frame(candles, lookback=lookback)
-    pf_frame = compute_particle_filter_frame(
-        candles_15m=candles,
-        regime_frame=regime_frame,
-        config=ParticleFilterConfig(
-            num_particles=active_config.particle_filter_particles,
-            lookback=lookback,
-        ),
+    pf_distance = pd.to_numeric(frame["pf_distance"], errors="coerce")
+    confidence = pd.to_numeric(frame["confidence"], errors="coerce")
+    confidence_ok = confidence >= float(active_config.min_pf_confidence)
+    up_mask = pf_distance >= float(active_config.min_abs_gap)
+    down_mask = pf_distance <= -float(active_config.min_abs_gap)
+
+    frame.loc[up_mask & confidence_ok, "trade_side"] = "UP"
+    frame.loc[down_mask & confidence_ok, "trade_side"] = "DOWN"
+    return frame
+
+
+def generate_pf_gap_signal(
+    interval_frame: pd.DataFrame,
+    config: BacktestConfig | None = None,
+    **_: object,
+) -> pd.DataFrame:
+    """Backward-compatible wrapper for the stricter PF-distance signal."""
+
+    return generate_signal_from_pf_distance(interval_frame, config=config)
+
+
+def generate_threshold_signals(
+    interval_frame: pd.DataFrame,
+    config: BacktestConfig | None = None,
+    **_: object,
+) -> pd.DataFrame:
+    """Backward-compatible alias for PF-distance signal generation."""
+
+    return generate_signal_from_pf_distance(interval_frame, config=config)
+
+
+def apply_hour_filter(
+    signal_frame: pd.DataFrame,
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Backward-compatible no-op: hour filtering is disabled in this version."""
+
+    frame = signal_frame.copy()
+    frame["blocked_hour_flag"] = False
+    return frame
+
+
+def apply_three_loss_pause(
+    signal_frame: pd.DataFrame,
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Run the 3-loss pause as a simple trade-loop state machine."""
+
+    cooldown_length = 1
+
+    rows: list[dict[str, object]] = []
+    consecutive_losses = 0
+    cooldown_remaining = 0
+
+    for row in signal_frame.to_dict(orient="records"):
+        trade_side = str(row["trade_side"])
+        eligible_signal = trade_side in {"UP", "DOWN"}
+        skip_reason = "NO_SIGNAL"
+        trade_taken = False
+        binary_win = float("nan")
+        actual_gap = float(row.get("actual_gap", abs(float(row.get("pf_distance", float("nan"))))))
+
+        if not eligible_signal:
+            skip_reason = "NO_SIGNAL"
+        elif cooldown_remaining > 0:
+            skip_reason = "COOLDOWN"
+        else:
+            skip_reason = "TRADE_EXECUTED"
+            trade_taken = True
+            binary_win = _binary_win_from_trade(trade_side, row["entry_price"], row["exit_price"])
+
+            if binary_win >= 1.0:
+                consecutive_losses = 0
+            else:
+                consecutive_losses += 1
+                if consecutive_losses >= 3:
+                    cooldown_remaining = cooldown_length
+                    consecutive_losses = 0
+
+        rows.append(
+            {
+                "contract_start": row["contract_start"],
+                "contract_end": row["contract_end"],
+                "interval_start_price": row["interval_start_price"],
+                "pf_fair_value_at_entry": row["pf_fair_value_at_entry"],
+                "pf_distance": row["pf_distance"],
+                "actual_gap": actual_gap,
+                "entry_price": row["entry_price"],
+                "exit_price": row["exit_price"],
+                "confidence": row["confidence"],
+                "binary_win": binary_win,
+                "trade_side": trade_side,
+                "skip_reason": skip_reason,
+                "_trade_taken": int(trade_taken),
+            }
+        )
+
+        if skip_reason == "COOLDOWN":
+            cooldown_remaining = max(cooldown_remaining - 1, 0)
+
+    return pd.DataFrame(rows)
+
+
+def apply_three_loss_cooldown(
+    signal_frame: pd.DataFrame,
+    config: BacktestConfig | None = None,
+    **_: object,
+) -> pd.DataFrame:
+    """Backward-compatible alias for the 3-loss pause."""
+
+    return apply_three_loss_pause(signal_frame, config=config)
+
+
+def kalshi_taker_fee(
+    contracts: float,
+    price: float,
+    *,
+    fee_multiplier: float = 1.0,
+) -> float:
+    """Return Kalshi taker fee dollars, rounded up to the nearest cent."""
+
+    contracts_value = float(contracts)
+    price_value = float(price)
+    if contracts_value <= 0 or not np.isfinite(contracts_value):
+        return 0.0
+    if not np.isfinite(price_value):
+        return 0.0
+    if not 0.0 <= price_value <= 1.0:
+        raise ValueError("price must be between 0 and 1 inclusive")
+
+    raw_fee = 0.07 * fee_multiplier * contracts_value * price_value * (1.0 - price_value)
+    return float(math.ceil(max(raw_fee, 0.0) * 100.0 - 1e-12) / 100.0)
+
+
+def evaluate_trade_pnl(
+    trade_frame: pd.DataFrame,
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Evaluate per-trade binary PnL with Kalshi taker fees."""
+
+    active_config = config or BacktestConfig()
+    rows: list[dict[str, object]] = []
+
+    for row in trade_frame.to_dict(orient="records"):
+        trade_side = str(row["trade_side"])
+        trade_taken = int(row.get("_trade_taken", 0)) == 1
+        binary_win = pd.NA
+        gross_pnl_per_trade = float("nan")
+        fee = float("nan")
+        net_pnl_per_trade = float("nan")
+        actual_gap = float(row.get("actual_gap", abs(float(row.get("pf_distance", float("nan"))))))
+
+        if trade_taken:
+            contract_price = _contract_price_for_side(trade_side, active_config)
+            binary_win = int(_binary_win_from_trade(trade_side, row["entry_price"], row["exit_price"]))
+            gross_pnl_per_trade = active_config.contracts_per_trade * (
+                binary_win - contract_price
+            )
+            fee = kalshi_taker_fee(active_config.contracts_per_trade, contract_price)
+            net_pnl_per_trade = gross_pnl_per_trade - fee
+
+        rows.append(
+            {
+                "contract_start": row["contract_start"],
+                "contract_end": row["contract_end"],
+                "interval_start_price": row["interval_start_price"],
+                "pf_fair_value_at_entry": row["pf_fair_value_at_entry"],
+                "pf_distance": row["pf_distance"],
+                "actual_gap": actual_gap,
+                "entry_price": row["entry_price"],
+                "exit_price": row["exit_price"],
+                "confidence": row["confidence"],
+                "binary_win": binary_win,
+                "trade_side": trade_side,
+                "gross_pnl_per_trade": gross_pnl_per_trade,
+                "fee": fee,
+                "net_pnl_per_trade": net_pnl_per_trade,
+                "skip_reason": row["skip_reason"],
+            }
+        )
+
+    results = pd.DataFrame(rows)
+    results["binary_win"] = results["binary_win"].astype("Int64")
+    return results[FINAL_DATASET_COLUMNS]
+
+
+def evaluate_contract_pnl(
+    signal_frame: pd.DataFrame,
+    config: BacktestConfig | None = None,
+) -> pd.DataFrame:
+    """Backward-compatible alias for trade PnL evaluation."""
+
+    return evaluate_trade_pnl(signal_frame, config=config)
+
+
+def compute_drawdown_and_streaks(results: pd.DataFrame) -> dict[str, float | int]:
+    """Compute max drawdown and longest streaks across executed trades."""
+
+    trades = results.loc[results["skip_reason"] == "TRADE_EXECUTED"].copy()
+    if trades.empty:
+        return {
+            "max_drawdown": 0.0,
+            "longest_win_streak": 0,
+            "longest_loss_streak": 0,
+        }
+
+    cumulative_net = pd.to_numeric(trades["net_pnl_per_trade"], errors="coerce").fillna(0.0).cumsum()
+    running_peak = cumulative_net.cummax()
+    max_drawdown = float((running_peak - cumulative_net).max()) if not cumulative_net.empty else 0.0
+
+    longest_win_streak = 0
+    longest_loss_streak = 0
+    current_win_streak = 0
+    current_loss_streak = 0
+    for binary_win in pd.to_numeric(trades["binary_win"], errors="coerce"):
+        if binary_win >= 1.0:
+            current_win_streak += 1
+            current_loss_streak = 0
+            longest_win_streak = max(longest_win_streak, current_win_streak)
+        else:
+            current_loss_streak += 1
+            current_win_streak = 0
+            longest_loss_streak = max(longest_loss_streak, current_loss_streak)
+
+    return {
+        "max_drawdown": max_drawdown,
+        "longest_win_streak": int(longest_win_streak),
+        "longest_loss_streak": int(longest_loss_streak),
+    }
+
+
+def summarize_backtest(results: pd.DataFrame) -> pd.DataFrame:
+    """Summarize executed-trade performance."""
+
+    if results.empty:
+        return pd.DataFrame()
+
+    trades = results.loc[results["skip_reason"] == "TRADE_EXECUTED"].copy()
+    streaks = compute_drawdown_and_streaks(results)
+    return pd.DataFrame(
+        [
+            {
+                "total_trades": int(len(trades)),
+                "win_rate": float(pd.to_numeric(trades["binary_win"], errors="coerce").mean()) if not trades.empty else np.nan,
+                "gross_pnl": float(pd.to_numeric(trades["gross_pnl_per_trade"], errors="coerce").sum()) if not trades.empty else 0.0,
+                "total_fees": float(pd.to_numeric(trades["fee"], errors="coerce").sum()) if not trades.empty else 0.0,
+                "net_pnl": float(pd.to_numeric(trades["net_pnl_per_trade"], errors="coerce").sum()) if not trades.empty else 0.0,
+                "average_net_pnl_per_trade": float(pd.to_numeric(trades["net_pnl_per_trade"], errors="coerce").mean()) if not trades.empty else np.nan,
+                "max_drawdown": float(streaks["max_drawdown"]),
+                "longest_win_streak": int(streaks["longest_win_streak"]),
+                "longest_loss_streak": int(streaks["longest_loss_streak"]),
+            }
+        ]
     )
-    pf_columns = [
-        "pf_fair_price",
-        "pf_gap",
-        "pf_gap_pct",
-        "pf_drift",
-        "pf_uncertainty",
-        "pf_confidence",
-        "pf_price_below_fair",
-        "pf_price_above_fair",
-        "pf_bull_long_setup",
-        "pf_bear_short_setup",
-    ]
-    return candles.join(regime_frame, how="left").join(pf_frame[pf_columns], how="left")
 
 
-def evaluate_trade_filters(
-    trade_row: pd.Series,
-    min_normalized_gap: float = 0.8,
-    min_raw_gap: float = 100.0,
-    max_pf_confidence: float = 0.4,
-    use_regime_filter: bool = False,
-    max_regime_confidence: float = 0.8,
-    use_pwin_filter: bool = False,
-    min_p_win: float = 0.6,
-    allowed_hours: Sequence[int] | None = None,
-    allowed_days: Sequence[int] | None = None,
-) -> tuple[bool, list[str]]:
-    """Return whether a baseline trade passes the high-edge filter layer.
+def summarize_skip_reasons(results: pd.DataFrame) -> pd.DataFrame:
+    """Summarize why rows were not traded."""
 
-    These are policy filters layered on top of the statistical model outputs.
-    They do not change the regime or PF equations; they decide when a modeled
-    edge is strong enough to allow a trade in backtests.
-    """
+    if results.empty:
+        return pd.DataFrame()
 
-    failures: list[str] = []
-
-    normalized_gap = _finite_or_nan(trade_row.get("normalized_gap"))
-    raw_gap = _finite_or_nan(trade_row.get("raw_gap"))
-    pf_confidence = _finite_or_nan(trade_row.get("pf_confidence"))
-    regime_confidence = _finite_or_nan(trade_row.get("regime_confidence"))
-    p_win = _finite_or_nan(trade_row.get("p_win"))
-    entry_hour_utc = trade_row.get("entry_hour_utc")
-    entry_weekday = trade_row.get("entry_weekday")
-
-    if not np.isfinite(normalized_gap) or normalized_gap < float(min_normalized_gap):
-        failures.append("normalized_gap_below_min")
-    if not np.isfinite(raw_gap) or raw_gap < float(min_raw_gap):
-        failures.append("raw_gap_below_min")
-    if not np.isfinite(pf_confidence) or pf_confidence > float(max_pf_confidence):
-        failures.append("pf_confidence_above_max")
-    if use_regime_filter and (not np.isfinite(regime_confidence) or regime_confidence > float(max_regime_confidence)):
-        failures.append("regime_confidence_above_max")
-    if use_pwin_filter and (not np.isfinite(p_win) or p_win < float(min_p_win)):
-        failures.append("p_win_below_min")
-    if allowed_hours is not None and int(entry_hour_utc) not in set(int(hour) for hour in allowed_hours):
-        failures.append("hour_not_allowed")
-    if allowed_days is not None and int(entry_weekday) not in set(int(day) for day in allowed_days):
-        failures.append("weekday_not_allowed")
-
-    return len(failures) == 0, failures
+    skip_counts = results["skip_reason"].value_counts()
+    return pd.DataFrame(
+        [
+            {
+                "cooldown_skips": int(skip_counts.get("COOLDOWN", 0)),
+                "no_signal_rows": int(skip_counts.get("NO_SIGNAL", 0)),
+            }
+        ]
+    )
 
 
 def run_backtest(
     candles_15m: pd.DataFrame,
     config: BacktestConfig | None = None,
 ) -> pd.DataFrame:
-    """Backtest interval-open entries with binary-share sizing outputs.
-
-    Directional outcome is still determined from BTC price movement over the bar,
-    but the reported economics are expressed as prediction-market shares:
-    - pay x to buy one share
-    - settle to 1.0 if correct, else 0.0
-    - gross per-share PnL = settlement - x
-    - net per-share PnL = settlement - effective_share_price
-    """
+    """Run the lean PF-distance backtest and return the clean final dataset."""
 
     active_config = config or BacktestConfig()
-    signal_frame = build_backtest_signal_frame(candles_15m, config=active_config)
-    if signal_frame.empty or len(signal_frame) < 2:
-        return pd.DataFrame()
-
-    bar_delta = _infer_bar_delta(signal_frame.index)
-    rows: list[dict[str, object]] = []
-
-    for row_number in range(1, len(signal_frame)):
-        signal_ts = signal_frame.index[row_number - 1]
-        entry_ts = signal_frame.index[row_number]
-        signal_row = signal_frame.iloc[row_number - 1]
-        entry_row = signal_frame.iloc[row_number]
-        entry_price = float(entry_row["open"])
-        exit_price = float(entry_row["close"])
-        regime_label = str(signal_row.get("regime", "neutral")).lower()
-        regime_confidence = _finite_or_none(signal_row.get("confidence"))
-        pf_fair_price = _finite_or_none(signal_row.get("pf_fair_price"))
-        pf_uncertainty = _finite_or_none(signal_row.get("pf_uncertainty"))
-        pf_confidence = _finite_or_none(signal_row.get("pf_confidence"))
-        market_share_price = _market_share_price_for_regime(active_config, regime_label)
-
-        sizing = None
-        if market_share_price is not None:
-            sizing = compute_kelly_from_pf(
-                live_price=entry_price,
-                fair_price_pf=pf_fair_price if pf_fair_price is not None else np.nan,
-                pf_uncertainty=pf_uncertainty if pf_uncertainty is not None else np.nan,
-                pf_confidence=pf_confidence,
-                regime_label=regime_label,
-                regime_confidence=regime_confidence,
-                market_share_price=market_share_price,
-                fee_rate=active_config.fee_rate,
-                alpha=active_config.alpha,
-                min_gap_scale=active_config.min_gap_scale,
-                fractional_kelly=active_config.fractional_kelly,
-                max_fraction=active_config.max_fraction,
-                use_confidence_shrink=active_config.use_confidence_shrink,
-            )
-
-        baseline_no_trade_reason = _baseline_no_trade_reason(
-            regime_label=regime_label,
-            regime_confidence=regime_confidence,
-            regime_confidence_threshold=active_config.regime_confidence_threshold,
-            sizing=sizing,
-        )
-        baseline_trade_taken = int(baseline_no_trade_reason is None)
-        trade_side = sizing.trade_side if sizing is not None else None
-        share_settlement_value = (
-            _share_settlement_value_for_trade(trade_side, entry_price, exit_price)
-            if baseline_trade_taken
-            else np.nan
-        )
-        win_loss = int(share_settlement_value) if baseline_trade_taken else np.nan
-        gross_share_pnl_per_share = (
-            _share_pnl_per_share(share_settlement_value, market_share_price)
-            if baseline_trade_taken and market_share_price is not None
-            else np.nan
-        )
-        net_share_pnl_per_share = (
-            _share_pnl_per_share(share_settlement_value, sizing.effective_share_price)
-            if baseline_trade_taken and sizing is not None and sizing.effective_share_price is not None
-            else np.nan
-        )
-        kelly_bankroll_return = (
-            _kelly_bankroll_return(share_settlement_value, sizing.kelly_fraction, sizing.effective_share_price)
-            if baseline_trade_taken and sizing is not None and sizing.effective_share_price is not None
-            else np.nan
-        )
-
-        row = {
-            "signal_time_utc": signal_ts,
-            "entry_time_utc": entry_ts,
-            "interval_end_utc": entry_ts + bar_delta,
-            "interval_start_price": entry_price,
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "trade_side": trade_side,
-            "regime": regime_label,
-            "regime_confidence": regime_confidence,
-            "pf_fair_price": pf_fair_price,
-            "pf_uncertainty": pf_uncertainty,
-            "pf_confidence": pf_confidence,
-            "raw_gap": sizing.raw_gap if sizing is not None else np.nan,
-            "normalized_gap": sizing.normalized_gap if sizing is not None else np.nan,
-            "z_score": sizing.z_score if sizing is not None else np.nan,
-            "p_base": sizing.p_base if sizing is not None else np.nan,
-            "p_win": sizing.p_final if sizing is not None else np.nan,
-            "confidence_multiplier": sizing.confidence_multiplier if sizing is not None else np.nan,
-            "market_share_price": market_share_price,
-            "kelly_fraction": sizing.kelly_fraction if sizing is not None else 0.0,
-            "kelly_size_pct": (sizing.kelly_fraction * 100.0) if sizing is not None else 0.0,
-            "raw_kelly": sizing.raw_kelly if sizing is not None else 0.0,
-            "expected_log_growth": sizing.expected_log_growth if sizing is not None else 0.0,
-            "break_even_prob": sizing.break_even_prob if sizing is not None else np.nan,
-            "effective_share_price": sizing.effective_share_price if sizing is not None else np.nan,
-            "net_odds": sizing.net_odds if sizing is not None else np.nan,
-            "share_settlement_value": share_settlement_value,
-            "gross_share_pnl_per_share": gross_share_pnl_per_share,
-            "net_share_pnl_per_share": net_share_pnl_per_share,
-            "kelly_bankroll_return": kelly_bankroll_return,
-            "entry_hour_utc": int(entry_ts.hour),
-            "entry_weekday": int(entry_ts.weekday()),
-            "baseline_trade_taken": baseline_trade_taken,
-            "baseline_no_trade_reason": baseline_no_trade_reason,
-            "win_loss": win_loss,
-        }
-
-        passed_filters = False
-        filter_failures: list[str] = []
-        if baseline_trade_taken:
-            passed_filters, filter_failures = evaluate_trade_filters(
-                pd.Series(row),
-                min_normalized_gap=active_config.min_normalized_gap,
-                min_raw_gap=active_config.min_raw_gap,
-                max_pf_confidence=active_config.max_pf_confidence,
-                use_regime_filter=active_config.use_regime_filter,
-                max_regime_confidence=active_config.max_regime_confidence,
-                use_pwin_filter=active_config.use_pwin_filter,
-                min_p_win=active_config.min_p_win,
-                allowed_hours=active_config.allowed_hours,
-                allowed_days=active_config.allowed_days,
-            )
-
-        row["filter_passed"] = int(passed_filters)
-        row["filtered_trade_taken"] = int(baseline_trade_taken and passed_filters)
-        row["filtered_no_trade_reason"] = "" if passed_filters else ",".join(filter_failures)
-        row["filter_failure_reasons"] = ",".join(filter_failures) if active_config.log_filter_reasons else ""
-        rows.append(row)
-
-    return pd.DataFrame(rows)
-
-
-def summarize_backtest(results: pd.DataFrame) -> pd.DataFrame:
-    """Compare filtered and baseline cohorts in a compact one-row summary."""
-
-    if results.empty:
-        return pd.DataFrame()
-
-    baseline = results.loc[results["baseline_trade_taken"] == 1].copy()
-    filtered = results.loc[results["filtered_trade_taken"] == 1].copy()
-
-    baseline_count = int(len(baseline))
-    filtered_count = int(len(filtered))
-    baseline_win_rate = float(baseline["win_loss"].mean()) if baseline_count else np.nan
-    filtered_win_rate = float(filtered["win_loss"].mean()) if filtered_count else np.nan
-    reduction = np.nan
-    if baseline_count:
-        reduction = float(100.0 * (1.0 - (filtered_count / baseline_count)))
-
-    summary = {
-        "total_trades_filtered": filtered_count,
-        "win_rate_filtered": filtered_win_rate,
-        "total_trades_unfiltered": baseline_count,
-        "win_rate_unfiltered": baseline_win_rate,
-        "trade_frequency_reduction_pct": reduction,
-        "wins_filtered": int(filtered["win_loss"].sum()) if filtered_count else 0,
-        "wins_unfiltered": int(baseline["win_loss"].sum()) if baseline_count else 0,
-        "avg_net_share_pnl_per_share_filtered": float(filtered["net_share_pnl_per_share"].mean()) if filtered_count else np.nan,
-        "avg_net_share_pnl_per_share_unfiltered": float(baseline["net_share_pnl_per_share"].mean()) if baseline_count else np.nan,
-        "avg_kelly_fraction_filtered": float(filtered["kelly_fraction"].mean()) if filtered_count else np.nan,
-        "avg_kelly_fraction_unfiltered": float(baseline["kelly_fraction"].mean()) if baseline_count else np.nan,
-        "avg_kelly_bankroll_return_filtered": float(filtered["kelly_bankroll_return"].mean()) if filtered_count else np.nan,
-        "avg_kelly_bankroll_return_unfiltered": float(baseline["kelly_bankroll_return"].mean()) if baseline_count else np.nan,
-    }
-    return pd.DataFrame([summary])
-
-
-def run_filter_grid_search(
-    results: pd.DataFrame,
-    normalized_gap_thresholds: Sequence[float],
-    raw_gap_thresholds: Sequence[float],
-    pf_confidence_thresholds: Sequence[float],
-    *,
-    use_regime_filter: bool = False,
-    max_regime_confidence: float = 0.8,
-    use_pwin_filter: bool = False,
-    min_p_win: float = 0.6,
-    allowed_hours: Sequence[int] | None = None,
-    allowed_days: Sequence[int] | None = None,
-) -> pd.DataFrame:
-    """Sweep filter thresholds against the baseline cohort and rank outcomes."""
-
-    if results.empty:
-        return pd.DataFrame()
-
-    baseline = results.loc[results["baseline_trade_taken"] == 1].copy()
-    baseline_count = int(len(baseline))
-    baseline_win_rate = float(baseline["win_loss"].mean()) if baseline_count else np.nan
-    if baseline.empty:
-        return pd.DataFrame()
-
-    rows: list[dict[str, object]] = []
-    for normalized_gap, raw_gap, pf_confidence in product(
-        normalized_gap_thresholds,
-        raw_gap_thresholds,
-        pf_confidence_thresholds,
-    ):
-        filtered_mask = _vectorized_filter_mask(
-            baseline,
-            min_normalized_gap=float(normalized_gap),
-            min_raw_gap=float(raw_gap),
-            max_pf_confidence=float(pf_confidence),
-            use_regime_filter=use_regime_filter,
-            max_regime_confidence=max_regime_confidence,
-            use_pwin_filter=use_pwin_filter,
-            min_p_win=min_p_win,
-            allowed_hours=allowed_hours,
-            allowed_days=allowed_days,
-        )
-        cohort = baseline.loc[filtered_mask].copy()
-        trade_count = int(len(cohort))
-        win_rate = float(cohort["win_loss"].mean()) if trade_count else np.nan
-        reduction = float(100.0 * (1.0 - (trade_count / baseline_count))) if baseline_count else np.nan
-        rows.append(
-            {
-                "min_normalized_gap": float(normalized_gap),
-                "min_raw_gap": float(raw_gap),
-                "max_pf_confidence": float(pf_confidence),
-                "use_regime_filter": int(use_regime_filter),
-                "max_regime_confidence": float(max_regime_confidence),
-                "use_pwin_filter": int(use_pwin_filter),
-                "min_p_win": float(min_p_win),
-                "total_trades_filtered": trade_count,
-                "win_rate_filtered": win_rate,
-                "total_trades_unfiltered": baseline_count,
-                "win_rate_unfiltered": baseline_win_rate,
-                "trade_frequency_reduction_pct": reduction,
-            }
-        )
-
-    sweep = pd.DataFrame(rows)
-    if not sweep.empty:
-        sweep = sweep.sort_values(
-            by=["win_rate_filtered", "total_trades_filtered", "min_normalized_gap", "min_raw_gap"],
-            ascending=[False, False, True, True],
-            na_position="last",
-        ).reset_index(drop=True)
-    return sweep
-
-
-def plot_filter_sweep_tradeoff(
-    sweep_results: pd.DataFrame,
-    threshold_column: str,
-):
-    """Plot average win rate and trade count against one swept parameter."""
-
-    if sweep_results.empty:
-        raise ValueError("sweep_results is empty")
-    if threshold_column not in sweep_results.columns:
-        raise ValueError(f"{threshold_column} is not a column in sweep_results")
-
-    try:
-        import plotly.graph_objects as go
-    except ModuleNotFoundError as exc:  # pragma: no cover - optional dependency path
-        raise RuntimeError("plotly is required to plot sweep tradeoffs") from exc
-
-    grouped = (
-        sweep_results.groupby(threshold_column, dropna=False)
-        .agg(
-            win_rate_filtered=("win_rate_filtered", "mean"),
-            total_trades_filtered=("total_trades_filtered", "mean"),
-        )
-        .reset_index()
-        .sort_values(threshold_column)
-    )
-
-    figure = go.Figure()
-    figure.add_trace(
-        go.Scatter(
-            x=grouped[threshold_column],
-            y=grouped["win_rate_filtered"],
-            mode="lines+markers",
-            name="Win Rate",
-            yaxis="y1",
-        )
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=grouped[threshold_column],
-            y=grouped["total_trades_filtered"],
-            mode="lines+markers",
-            name="Trade Count",
-            yaxis="y2",
-        )
-    )
-    figure.update_layout(
-        title=f"Filtered Win Rate vs Trade Count by {threshold_column}",
-        xaxis_title=threshold_column,
-        yaxis=dict(title="Average Win Rate", tickformat=".1%"),
-        yaxis2=dict(title="Average Trade Count", overlaying="y", side="right"),
-        legend=dict(orientation="h"),
-    )
-    return figure
+    interval_frame = build_interval_frame(candles_15m, config=active_config)
+    if interval_frame.empty:
+        return pd.DataFrame(columns=FINAL_DATASET_COLUMNS)
+    signal_frame = generate_signal_from_pf_distance(interval_frame, config=active_config)
+    cooled = apply_three_loss_pause(signal_frame, config=active_config)
+    return evaluate_trade_pnl(cooled, config=active_config)
 
 
 def export_backtest_excel(
     output_path: str | Path,
     results: pd.DataFrame,
     summary: pd.DataFrame,
-    sweep_results: pd.DataFrame | None = None,
+    skip_summary: pd.DataFrame | None = None,
 ) -> Path:
-    """Write baseline, filtered, and summary views to a workbook.
-
-    The exported trade rows use binary-share economics, not sportsbook-style
-    odds. `market_share_price` is the raw share cost, `effective_share_price`
-    is the all-in cost after fees, and settlement is always either 1.0 or 0.0.
-    """
+    """Write the lean backtest outputs to Excel."""
 
     workbook_path = Path(output_path)
-    baseline = results.loc[results["baseline_trade_taken"] == 1].copy() if not results.empty else pd.DataFrame()
-    filtered = results.loc[results["filtered_trade_taken"] == 1].copy() if not results.empty else pd.DataFrame()
-    excel_summary = _excel_safe_frame(summary)
-    excel_baseline = _excel_safe_frame(baseline)
-    excel_filtered = _excel_safe_frame(filtered)
     excel_results = _excel_safe_frame(results)
-    excel_sweep = _excel_safe_frame(sweep_results) if sweep_results is not None else None
+    excel_summary = _excel_safe_frame(summary)
+    excel_skip_summary = _excel_safe_frame(skip_summary) if skip_summary is not None else None
     workbook_path.parent.mkdir(parents=True, exist_ok=True)
     temp_workbook_path: Path | None = None
 
@@ -508,29 +491,19 @@ def export_backtest_excel(
         ) as temp_file:
             temp_workbook_path = Path(temp_file.name)
 
-        # Write the workbook to a local temp file first, then atomically replace
-        # the destination. This is much more robust on synced folders where
-        # random-access writes inside the zip container can time out.
         with pd.ExcelWriter(temp_workbook_path, engine="openpyxl") as writer:
+            excel_results.to_excel(writer, sheet_name="trade_log", index=False)
             excel_summary.to_excel(writer, sheet_name="summary", index=False)
-            excel_baseline.to_excel(writer, sheet_name="baseline_trades", index=False)
-            excel_filtered.to_excel(writer, sheet_name="filtered_trades", index=False)
-            excel_results.to_excel(writer, sheet_name="all_intervals", index=False)
-            if excel_sweep is not None and not excel_sweep.empty:
-                excel_sweep.to_excel(writer, sheet_name="grid_search", index=False)
+            if excel_skip_summary is not None and not excel_skip_summary.empty:
+                excel_skip_summary.to_excel(writer, sheet_name="skip_summary", index=False)
         os.replace(temp_workbook_path, workbook_path)
-    except ModuleNotFoundError as exc:  # pragma: no cover - startup guard
+    except ModuleNotFoundError as exc:  # pragma: no cover
         if exc.name == "openpyxl":
             raise RuntimeError(
                 "openpyxl is required to export Excel files. Install it with "
                 "`python -m pip install openpyxl` and rerun the backtest."
             ) from exc
         raise
-    except TimeoutError as exc:
-        temp_location = f" Temporary workbook may be at {temp_workbook_path}." if temp_workbook_path is not None else ""
-        raise RuntimeError(
-            f"Timed out while exporting the Excel workbook to {workbook_path}.{temp_location}"
-        ) from exc
     finally:
         if temp_workbook_path is not None and temp_workbook_path.exists():
             try:
@@ -541,110 +514,30 @@ def export_backtest_excel(
     return workbook_path
 
 
-def _baseline_no_trade_reason(
-    *,
-    regime_label: str,
-    regime_confidence: float | None,
-    regime_confidence_threshold: float,
-    sizing,
-) -> str | None:
-    if regime_label not in {"bull", "bear"}:
-        return "neutral_regime"
-    if regime_confidence is None or not np.isfinite(regime_confidence):
-        return "invalid_regime_confidence"
-    if regime_confidence <= float(regime_confidence_threshold):
-        return "regime_confidence_below_threshold"
-    if sizing is None:
-        return "missing_kelly_inputs"
-    return sizing.no_trade_reason
-
-
-def _market_share_price_for_regime(config: BacktestConfig, regime_label: str) -> float | None:
-    if regime_label == "bull":
+def _contract_price_for_side(trade_side: str, config: BacktestConfig) -> float:
+    if trade_side == "UP":
         return float(config.market_up_price)
-    if regime_label == "bear":
+    if trade_side == "DOWN":
         return float(config.market_down_price)
-    return None
+    return float("nan")
 
 
-def _win_loss_for_trade(trade_side: str | None, entry_price: float, exit_price: float) -> int:
-    return int(_share_settlement_value_for_trade(trade_side, entry_price, exit_price))
-
-
-def _share_settlement_value_for_trade(trade_side: str | None, entry_price: float, exit_price: float) -> float:
-    # Binary-share settlement is always 1.0 for a correct prediction and 0.0
-    # otherwise. The market share price is handled separately in the PnL columns.
-    if str(trade_side).upper() == "UP":
+def _binary_win_from_trade(trade_side: str, entry_price: float, exit_price: float) -> float:
+    if trade_side == "UP":
         return float(exit_price > entry_price)
-    if str(trade_side).upper() == "DOWN":
+    if trade_side == "DOWN":
         return float(exit_price < entry_price)
-    return 0.0
-
-
-def _share_pnl_per_share(settlement_value: float, share_price: float | None) -> float:
-    if share_price is None or not np.isfinite(share_price):
-        return float("nan")
-    # Per-share PnL is settlement - cost, so the same helper works for both
-    # gross PnL (raw market price) and net PnL (effective all-in price).
-    return float(settlement_value - float(share_price))
-
-
-def _kelly_bankroll_return(
-    settlement_value: float,
-    kelly_fraction: float,
-    effective_share_price: float | None,
-) -> float:
-    if effective_share_price is None or not np.isfinite(effective_share_price):
-        return float("nan")
-    if not np.isfinite(kelly_fraction):
-        return float("nan")
-    if settlement_value >= 1.0:
-        return float(kelly_fraction * ((1.0 - effective_share_price) / effective_share_price))
-    return float(-kelly_fraction)
-
-
-def _vectorized_filter_mask(
-    frame: pd.DataFrame,
-    *,
-    min_normalized_gap: float,
-    min_raw_gap: float,
-    max_pf_confidence: float,
-    use_regime_filter: bool,
-    max_regime_confidence: float,
-    use_pwin_filter: bool,
-    min_p_win: float,
-    allowed_hours: Sequence[int] | None,
-    allowed_days: Sequence[int] | None,
-) -> pd.Series:
-    mask = (
-        frame["normalized_gap"].ge(float(min_normalized_gap))
-        & frame["raw_gap"].ge(float(min_raw_gap))
-        & frame["pf_confidence"].le(float(max_pf_confidence))
-    )
-    if use_regime_filter:
-        mask &= frame["regime_confidence"].le(float(max_regime_confidence))
-    if use_pwin_filter:
-        mask &= frame["p_win"].ge(float(min_p_win))
-    if allowed_hours is not None:
-        mask &= frame["entry_hour_utc"].isin([int(hour) for hour in allowed_hours])
-    if allowed_days is not None:
-        mask &= frame["entry_weekday"].isin([int(day) for day in allowed_days])
-    return mask.fillna(False)
-
-
-def _finite_or_none(value: object) -> float | None:
-    try:
-        numeric = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not np.isfinite(numeric):
-        return None
-    return numeric
+    return float("nan")
 
 
 def _finite_or_nan(value: object) -> float:
-    numeric = _finite_or_none(value)
-    return float(numeric) if numeric is not None else float("nan")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    if not np.isfinite(numeric):
+        return float("nan")
+    return numeric
 
 
 def _infer_bar_delta(index: pd.DatetimeIndex) -> pd.Timedelta:

@@ -225,17 +225,26 @@ def run_dashboard() -> None:
 
         strat_cols = st.columns(4)
         strat_cols[0].metric("Allowed Side", str(latest_signal.get("allowed_side", "n/a")))
-        strat_cols[1].metric("Regime Confidence", _fmt_pct(latest_signal.get("regime_confidence")))
+        strat_cols[1].metric("PF Confidence", _fmt_pct(latest_signal.get("pf_confidence")))
         strat_cols[2].metric("Model Probability", _fmt_pct(latest_signal.get("model_probability")))
-        strat_cols[3].metric("Kelly Fraction", _fmt_pct(latest_signal.get("kelly_fraction")))
+        strat_cols[3].metric("Regime Confidence", _fmt_pct(latest_signal.get("regime_confidence")))
+
+        strat_cols = st.columns(4)
+        strat_cols[0].metric("Kelly Fraction", _fmt_pct(latest_signal.get("kelly_fraction")))
+        strat_cols[1].metric("PF Min Confidence", _fmt_pct(settings.min_pf_confidence))
+        strat_cols[2].metric("PF Min Gap", _fmt_money(settings.min_pf_gap_dollars))
+        strat_cols[3].metric("Raw Kelly", _fmt_pct(latest_signal.get("raw_kelly")))
+
+        strat_cols = st.columns(4)
+        strat_cols[0].metric("Expected Log Growth", f"{float(latest_signal.get('expected_log_growth', 0.0)):.6f}" if latest_signal else "n/a")
+        strat_cols[1].metric("Reference source", latest_signal.get("reference_source", "n/a"))
+        strat_cols[2].metric("Decision", latest_signal.get("decision_side", "n/a"))
+        strat_cols[3].metric("Reason", latest_signal.get("decision_reason", "n/a"))
 
         signal_table = pd.DataFrame(
             [
                 {"item": "Decision", "value": latest_signal.get("decision_side", "n/a")},
                 {"item": "Reason", "value": latest_signal.get("decision_reason", "n/a")},
-                {"item": "Raw Kelly", "value": _fmt_pct(latest_signal.get("raw_kelly"))},
-                {"item": "Expected log growth", "value": f"{float(latest_signal.get('expected_log_growth', 0.0)):.6f}" if latest_signal else "n/a"},
-                {"item": "Reference source", "value": latest_signal.get("reference_source", "n/a")},
             ]
         )
         st.dataframe(signal_table, use_container_width=True, hide_index=True)

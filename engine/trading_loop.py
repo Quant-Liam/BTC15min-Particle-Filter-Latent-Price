@@ -35,6 +35,7 @@ class StrategyCycleSnapshot:
     btc_reference_price: float
     pf_fair_value: float
     pf_gap: float
+    pf_confidence: float
     regime: str
     allowed_side: str
     regime_confidence: float
@@ -47,6 +48,14 @@ class StrategyCycleSnapshot:
     model_probability: float | None
     market_yes_ask: float
     market_no_ask: float
+
+
+@dataclass(frozen=True)
+class EntryWindowGate:
+    window_start: pd.Timestamp
+    window_end: pd.Timestamp
+    should_evaluate: bool
+    reason: str
 
 
 class TradingLoop:
@@ -84,8 +93,9 @@ class TradingLoop:
                 self.store.add_log("ERROR", "trading_loop", str(exc))
             stop_event.wait(self.settings.loop_poll_seconds)
 
-    def _tick(self) -> None:
-        self.store.set_state("last_heartbeat_utc", pd.Timestamp.now(tz="UTC").isoformat())
+    def _tick(self, now_utc: pd.Timestamp | None = None) -> None:
+        now_utc = self._normalize_utc_timestamp(now_utc)
+        self.store.set_state("last_heartbeat_utc", now_utc.isoformat())
         settled = self.executor.sync_settlements()
         for row in settled:
             self.store.add_log("INFO", "executor", f"Settled {row['market_ticker']} with P&L {row['realized_pnl']:.2f}", row)
@@ -110,20 +120,21 @@ class TradingLoop:
             self.store.set_bot_status("RUNNING", "No active BTC 15-minute Kalshi demo market found.")
             return
 
-        last_market = self.store.get_state("last_cycle_market")
-        last_cycle_completed = self.store.get_state("last_cycle_completed_utc")
-        if last_market == market.ticker and last_cycle_completed is not None:
-            completed_ts = pd.Timestamp(last_cycle_completed)
-            if completed_ts.tzinfo is None:
-                completed_ts = completed_ts.tz_localize("UTC")
-            if (pd.Timestamp.now(tz="UTC") - completed_ts).total_seconds() < self.settings.cycle_min_seconds_between_runs:
-                self.store.set_bot_status("RUNNING", f"Monitoring {market.ticker}. Waiting for next BTC 15m market.")
-                return
+        cycle = self._build_strategy_snapshot(market, now_utc=now_utc)
+        self._persist_latest_analysis(cycle=cycle, analyzed_at_utc=now_utc)
 
-        cycle = self._build_strategy_snapshot(market)
+        entry_gate = self._entry_window_gate(now_utc=now_utc)
+        if not entry_gate.should_evaluate:
+            self.store.set_bot_status(
+                "RUNNING",
+                f"{cycle.decision_reason} Monitoring until the next 15-minute entry window at {entry_gate.window_end.isoformat()}.",
+            )
+            return
+
         signal_id = self.store.record_signal(asdict(cycle))
+        self._mark_window_evaluated(entry_gate.window_start)
         self.store.set_state("last_cycle_market", market.ticker)
-        self.store.set_state("last_cycle_completed_utc", pd.Timestamp.now(tz="UTC").isoformat())
+        self.store.set_state("last_cycle_completed_utc", now_utc.isoformat())
 
         if cycle.decision_side == "NO_TRADE":
             self.store.set_bot_status("RUNNING", cycle.decision_reason)
@@ -167,7 +178,13 @@ class TradingLoop:
             },
         )
 
-    def _build_strategy_snapshot(self, market: KalshiMarketSnapshot) -> StrategyCycleSnapshot:
+    def _build_strategy_snapshot(
+        self,
+        market: KalshiMarketSnapshot,
+        *,
+        now_utc: pd.Timestamp | None = None,
+    ) -> StrategyCycleSnapshot:
+        now_utc = self._normalize_utc_timestamp(now_utc)
         candles_15m = self.reference_feed.fetch_recent_candles("15m", limit=self.settings.candle_limit_15m)
         live_price = float(self.reference_feed.get_current_btc_price())
 
@@ -189,7 +206,7 @@ class TradingLoop:
         fair_value = project_particle_filter_to_time(
             snapshot=pf_snapshot,
             last_observation_time=last_observation_time,
-            target_time=pd.Timestamp.now(tz="UTC"),
+            target_time=now_utc,
         )
         pf_gap = live_price - fair_value
 
@@ -231,19 +248,22 @@ class TradingLoop:
             decision=decision,
             observed_price=live_price,
             fair_price=fair_value,
-            min_gap=0.0,
+            min_gap=self.settings.min_pf_gap_dollars,
         )
 
         decision_reason = decision.reason
         decision_side = decision.side
-        if regime_snapshot.allowed_side in {"UP", "DOWN"} and regime_snapshot.confidence <= self.settings.regime_confidence_threshold:
+        if pf_snapshot.confidence < self.settings.min_pf_confidence:
+            decision_side = "NO_TRADE"
+            decision_reason = "Particle-filter confidence is below the live trading threshold."
+        elif regime_snapshot.allowed_side in {"UP", "DOWN"} and regime_snapshot.confidence <= self.settings.regime_confidence_threshold:
             decision_side = "NO_TRADE"
             decision_reason = "Regime confidence is below the live trading threshold."
         elif pf_kelly.no_trade_reason:
             decision_side = "NO_TRADE"
             decision_reason = pf_kelly.no_trade_reason
 
-        window_start, window_end = current_15m_window()
+        window_start, window_end = current_15m_window(now_utc.to_pydatetime())
         return StrategyCycleSnapshot(
             market_ticker=market.ticker,
             window_start_utc=window_start.isoformat(),
@@ -252,6 +272,7 @@ class TradingLoop:
             btc_reference_price=live_price,
             pf_fair_value=fair_value,
             pf_gap=pf_gap,
+            pf_confidence=pf_snapshot.confidence,
             regime=regime_snapshot.regime,
             allowed_side=regime_snapshot.allowed_side,
             regime_confidence=regime_snapshot.confidence,
@@ -265,6 +286,49 @@ class TradingLoop:
             market_yes_ask=market_yes_ask,
             market_no_ask=market_no_ask,
         )
+
+    def _entry_window_gate(self, *, now_utc: pd.Timestamp | None = None) -> EntryWindowGate:
+        now_utc = self._normalize_utc_timestamp(now_utc)
+        window_start, window_end = current_15m_window(now_utc.to_pydatetime())
+        last_evaluated = self.store.get_state("last_strategy_window_start_utc")
+        if last_evaluated == window_start.isoformat():
+            return EntryWindowGate(
+                window_start=window_start,
+                window_end=window_end,
+                should_evaluate=False,
+                reason=f"Monitoring BTC. Entry already evaluated for the {window_start.isoformat()} interval.",
+            )
+
+        grace_seconds = max(self.settings.loop_poll_seconds * 3, 15)
+        seconds_since_window_start = float((now_utc - window_start).total_seconds())
+        if seconds_since_window_start > grace_seconds:
+            return EntryWindowGate(
+                window_start=window_start,
+                window_end=window_end,
+                should_evaluate=False,
+                reason=(
+                    "Monitoring BTC. Entries are only evaluated at the start of each 15-minute interval; "
+                    f"next window opens at {window_end.isoformat()}."
+                ),
+            )
+
+        return EntryWindowGate(
+            window_start=window_start,
+            window_end=window_end,
+            should_evaluate=True,
+            reason=f"Evaluating BTC entry for the {window_start.isoformat()} interval.",
+        )
+
+    def _mark_window_evaluated(self, window_start: pd.Timestamp) -> None:
+        self.store.set_state("last_strategy_window_start_utc", window_start.isoformat())
+
+    def _persist_latest_analysis(self, *, cycle: StrategyCycleSnapshot, analyzed_at_utc: pd.Timestamp) -> None:
+        self.store.set_state("last_analysis_completed_utc", analyzed_at_utc.isoformat())
+        self.store.set_state("last_analysis_market", cycle.market_ticker)
+        self.store.set_state("last_analysis_window_start_utc", cycle.window_start_utc)
+        self.store.set_state("last_analysis_decision_side", cycle.decision_side)
+        self.store.set_state("last_analysis_reason", cycle.decision_reason)
+        self.store.set_state("last_analysis_snapshot", asdict(cycle))
 
     def _risk_failures(
         self,
@@ -308,6 +372,14 @@ class TradingLoop:
         if trade_side == "DOWN":
             return float(1.0 - p_final)
         return 0.5
+
+    @staticmethod
+    def _normalize_utc_timestamp(ts: pd.Timestamp | None) -> pd.Timestamp:
+        if ts is None:
+            return pd.Timestamp.now(tz="UTC")
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
 
 
 class TradingLoopController:

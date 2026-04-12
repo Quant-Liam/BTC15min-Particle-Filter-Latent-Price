@@ -17,6 +17,9 @@ class ParticleFilterConfig:
     resample_threshold: float = 0.50
     # Tuning area: how much price history the PF sees when run standalone.
     lookback: int = 240
+    # When False, the PF runs with neutral dynamics only and does not fit the
+    # separate regime/GARCH model first.
+    use_regime_context: bool = True
 
 
 @dataclass(frozen=True)
@@ -79,11 +82,13 @@ def compute_particle_filter_frame(
     if active_config.lookback > 0:
         closes = closes.tail(active_config.lookback)
 
-    if regime_frame is None or regime_frame.empty:
+    if active_config.use_regime_context and (regime_frame is None or regime_frame.empty):
         regime_frame = compute_regime_frame(
             candles_15m=candles_15m,
             lookback=active_config.lookback,
         )
+    elif regime_frame is None:
+        regime_frame = pd.DataFrame()
 
     # Observation is handled in log-price space so drift and noise behave like
     # percentage moves rather than raw BTC-dollar moves.
